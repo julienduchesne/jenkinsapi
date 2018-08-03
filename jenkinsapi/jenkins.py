@@ -1,10 +1,13 @@
 """
 Module for jenkinsapi Jenkins object
 """
+import time
 import logging
 import six.moves.urllib.parse as urlparse
 
 from six.moves.urllib.parse import quote as urlquote
+from six.moves.urllib.parse import urlencode
+from requests import HTTPError, ConnectionError
 from jenkinsapi import config
 from jenkinsapi.credentials import Credentials
 from jenkinsapi.credentials import Credentials2x
@@ -15,6 +18,7 @@ from jenkinsapi.view import View
 from jenkinsapi.label import Label
 from jenkinsapi.nodes import Nodes
 from jenkinsapi.plugins import Plugins
+from jenkinsapi.plugin import Plugin
 from jenkinsapi.views import Views
 from jenkinsapi.queue import Queue
 from jenkinsapi.fingerprint import Fingerprint
@@ -35,7 +39,7 @@ class Jenkins(JenkinsBase):
             self, baseurl,
             username=None, password=None,
             requester=None, lazy=False,
-            ssl_verify=True):
+            ssl_verify=True, cert=None, timeout=10):
         """
         :param baseurl: baseurl for jenkins instance including port, str
         :param username: username for jenkins auth, str
@@ -48,7 +52,11 @@ class Jenkins(JenkinsBase):
             username,
             password,
             baseurl=baseurl,
-            ssl_verify=ssl_verify)
+            ssl_verify=ssl_verify,
+            cert=cert,
+            timeout=timeout
+        )
+        self.requester.timeout = timeout
         self.lazy = lazy
         self.jobs_container = None
         JenkinsBase.__init__(self, baseurl, poll=not lazy)
@@ -101,7 +109,7 @@ class Jenkins(JenkinsBase):
 
     def get_nodes_url(self):
         # This only ever needs to work on the base object
-        return '%s/computer' % self.baseurl
+        return self.nodes.baseurl
 
     @property
     def jobs(self):
@@ -246,7 +254,7 @@ class Jenkins(JenkinsBase):
 
     def get_node(self, nodename):
         """Get a node object for a specific node"""
-        return self.get_nodes()[nodename]
+        return self.nodes[nodename]
 
     def get_node_url(self, nodename=""):
         """Return the url for nodes"""
@@ -265,8 +273,7 @@ class Jenkins(JenkinsBase):
         return Queue(queue_url, self)
 
     def get_nodes(self):
-        url = self.get_nodes_url()
-        return Nodes(url, self)
+        return Nodes(self.baseurl, self)
 
     @property
     def nodes(self):
@@ -289,9 +296,6 @@ class Jenkins(JenkinsBase):
         :param nodename: string holding a hostname
         :return: None
         """
-        assert self.has_node(nodename), \
-            "This node: %s is not registered as a slave" % nodename
-        assert nodename != "master", "you cannot delete the master node"
         del self.nodes[nodename]
 
     def create_node(self, name, num_executors=2, node_description=None,
@@ -324,33 +328,75 @@ class Jenkins(JenkinsBase):
         return '%s/pluginManager/api/python?depth=%i' % (self.baseurl, depth)
 
     def install_plugin(self, plugin):
-        plugin = str(plugin)
-        if '@' not in plugin or len(plugin.split('@')) != 2:
-            usage_err = ('argument must be a string like '
-                         '"plugin-name@version", not "{0}"')
-            usage_err = usage_err.format(plugin)
-            raise ValueError(usage_err)
-        payload = '<jenkins> <install plugin="{0}" /> </jenkins>'
-        payload = payload.format(plugin)
-        url = '%s/pluginManager/installNecessaryPlugins' % (self.baseurl,)
-        return self.requester.post_xml_and_confirm_status(
-            url, data=payload)
+        if not isinstance(plugin, Plugin):
+            plugin = Plugin(plugin)
+        self.plugins[plugin.shortName] = plugin
 
-    def install_plugins(self, plugin_list, restart=False):
-        for plugin in plugin_list:
+    def install_plugins(self, plugin_list, restart=False,
+                        wait_for_reboot=False):
+        """
+        Install a list of plugins and optionally restart jenkins.
+        @param plugin_list: list of plugins to be installed
+        @param restart: Boolean, restart jenkins after plugin installation
+        """
+        plugins = [p if isinstance(p, Plugin) else Plugin(p)
+                   for p in plugin_list]
+        for plugin in plugins:
             self.install_plugin(plugin)
-        if restart:
-            self.safe_restart()
+        if restart and self.plugins.restart_required:
+            self.safe_restart(wait_for_reboot=wait_for_reboot)
 
-    def safe_restart(self):
+    def safe_restart(self, wait_for_reboot=False):
         """ restarts jenkins when no jobs are running """
         # NB: unlike other methods, the value of resp.status_code
         # here can be 503 even when everything is normal
         url = '%s/safeRestart' % (self.baseurl,)
-        valid = self.requester.VALID_STATUS_CODES + [503]
+        valid = self.requester.VALID_STATUS_CODES + [503, 500]
         resp = self.requester.post_and_confirm_status(url, data='',
                                                       valid=valid)
+        if wait_for_reboot:
+            self._wait_for_reboot()
         return resp
+
+    def _wait_for_reboot(self):
+        # We need to make sure all jobs have finished,
+        # and that jenkins is actually restarting.
+        # One way to be sure is to make sure jenkins is really down.
+        wait = 5
+        count = 0
+        max_count = 30
+        self.__jenkins_is_unavailable()  # Blocks until jenkins is restarting
+        while count < max_count:
+            time.sleep(wait)
+            try:
+                self.poll()
+                len(self.plugins)  # Make sure jenkins is fully started
+                return  # By this time jenkins is back online
+            except (HTTPError, ConnectionError):
+                msg = ("Jenkins has not restarted yet!  (This is"
+                       " try {0} of {1}, waited {2} seconds so far)"
+                       "  Sleeping and trying again..")
+                msg = msg.format(count, max_count, count * wait)
+                log.debug(msg)
+            count += 1
+        msg = ("Jenkins did not come back from safe restart! "
+               "Waited %s seconds altogether.  This "
+               "failure may cause other failures.")
+        log.critical(msg, count * wait)
+
+    def __jenkins_is_unavailable(self):
+        while True:
+            try:
+                self.requester.get_and_confirm_status(
+                    self.baseurl, valid=[503, 500])
+                return True
+            except ConnectionError:
+                # This is also a possibility while Jenkins is restarting
+                return True
+            except HTTPError:
+                # This is a return code that is not 503,
+                # so Jenkins is likely available
+                time.sleep(1)
 
     @property
     def plugins(self):
@@ -380,7 +426,7 @@ class Jenkins(JenkinsBase):
         version_key = 'X-Jenkins'
         return response.headers.get(version_key, '0.0')
 
-    def get_credentials(self, cred_class):
+    def get_credentials(self, cred_class=Credentials2x):
         """
         Return credentials
         """
@@ -406,3 +452,26 @@ class Jenkins(JenkinsBase):
     def shutdown(self):
         url = "%s/exit" % self.baseurl
         self.requester.post_and_confirm_status(url, data='')
+
+    def run_groovy_script(self, script):
+        """
+        Runs the requested groovy script on the Jenkins server returning the
+        result as text.
+        Raises a JenkinsAPIException if the returned HTTP response code from
+        the POST request is not 200 OK.
+
+        Example:
+
+            server = Jenkins(...)
+            script = 'println "Hello world!"'
+            result = server.run_groovy_script(script)
+            print(result) # will print "Hello world!"
+        """
+        url = "%s/scriptText" % self.baseurl
+        data = urlencode({'script': script})
+
+        response = self.requester.post_and_confirm_status(url, data=data)
+        if response.status_code != 200:
+            raise JenkinsAPIException('Unexpected response %d.' % response.status_code)
+
+        return response.text

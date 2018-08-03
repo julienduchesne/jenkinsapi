@@ -272,6 +272,10 @@ class Node(JenkinsBase):
                 "The node state has not changed: temporarilyOffline = %s" %
                 state)
 
+    @property
+    def _et(self):
+        return self._get_config_element_tree()
+
     def _get_config_element_tree(self):
         """
         Returns an xml element tree for the node's config.xml. The
@@ -297,21 +301,172 @@ class Node(JenkinsBase):
         Loads the config.xml for the node allowing it to be re-queried
         without generating new requests.
         """
+        if self.name == 'master':
+            raise JenkinsAPIException('master node does not have config.xml')
+
         self._config = self.get_config()
+        self._get_config_element_tree()
 
     def upload_config(self, config_xml):
         """
         Uploads config_xml to the config.xml for the node.
         """
+        if self.name == 'master':
+            raise JenkinsAPIException('master node does not have config.xml')
+
         self.jenkins.requester.post_and_confirm_status(
             "%(baseurl)s/config.xml" % self.__dict__,
-            data=config_xml.encode('utf-8'))
+            data=config_xml)
 
     def get_labels(self):
         """
         Returns the labels for a slave as a string with each label
         separated by the ' ' character.
         """
-        element_tree = self._get_config_element_tree()
-        label_element = element_tree.find('label')
-        return label_element.text
+        return self.get_config_element('label')
+
+    def get_num_executors(self):
+        try:
+            return self.get_config_element('numExecutors')
+        except JenkinsAPIException:
+            return self._data['numExecutors']
+
+    def set_num_executors(self, value):
+        """
+        Sets number of executors for node
+
+        Warning! Setting number of executors on master node will erase all
+        other settings
+        """
+        set_value = value if isinstance(value, str) else str(value)
+
+        if self.name == 'master':
+            # master node doesn't have config.xml, so we're going to submit
+            # form here
+            data = 'json=%s' % urlquote(
+                json.dumps({
+                    "numExecutors": set_value,
+                    "nodeProperties": {
+                        "stapler-class-bag": "true"
+                    }
+                })
+            )
+
+            url = self.baseurl + '/configSubmit'
+            self.jenkins.requester.post_and_confirm_status(url, data=data)
+        else:
+            self.set_config_element('numExecutors', set_value)
+
+        self.poll()
+
+    def get_config_element(self, el_name):
+        """
+        Returns simple config element.
+
+        Better not to be used to return "nodeProperties" or "launcher"
+        """
+        return self._et.find(el_name).text
+
+    def set_config_element(self, el_name, value):
+        """
+        Sets simple config element
+        """
+        self._et.find(el_name).text = value
+        xml_str = ET.tostring(self._et)
+        self.upload_config(xml_str)
+
+    def get_monitor(self, monitor_name, poll_monitor=True):
+        """
+        Polls the node returning one of the monitors in the monitorData branch of the
+        returned node api tree.
+        """
+        monitor_data_key = 'monitorData'
+        if poll_monitor:
+            # polling as monitors like response time can be updated
+            monitor_data = self.poll(tree=monitor_data_key)[monitor_data_key]
+        else:
+            monitor_data = self._data[monitor_data_key]
+
+        full_monitor_name = 'hudson.node_monitors.{0}'.format(monitor_name)
+        if full_monitor_name not in monitor_data:
+            raise AssertionError('Node monitor %s not found' % monitor_name)
+
+        return monitor_data[full_monitor_name]
+
+    def get_available_physical_memory(self):
+        """
+        Returns the node's available physical memory in bytes.
+        """
+        monitor_data = self.get_monitor('SwapSpaceMonitor')
+        return monitor_data['availablePhysicalMemory']
+
+    def get_available_swap_space(self):
+        """
+        Returns the node's available swap space in bytes.
+        """
+        monitor_data = self.get_monitor('SwapSpaceMonitor')
+        return monitor_data['availableSwapSpace']
+
+    def get_total_physical_memory(self):
+        """
+        Returns the node's total physical memory in bytes.
+        """
+        monitor_data = self.get_monitor('SwapSpaceMonitor')
+        return monitor_data['totalPhysicalMemory']
+
+    def get_total_swap_space(self):
+        """
+        Returns the node's total swap space in bytes.
+        """
+        monitor_data = self.get_monitor('SwapSpaceMonitor')
+        return monitor_data['totalSwapSpace']
+
+    def get_workspace_path(self):
+        """
+        Returns the local path to the node's Jenkins workspace directory.
+        """
+        monitor_data = self.get_monitor('DiskSpaceMonitor')
+        return monitor_data['path']
+
+    def get_workspace_size(self):
+        """
+        Returns the size in bytes of the node's Jenkins workspace directory.
+        """
+        monitor_data = self.get_monitor('DiskSpaceMonitor')
+        return monitor_data['size']
+
+    def get_temp_path(self):
+        """
+        Returns the local path to the node's temp directory.
+        """
+        monitor_data = self.get_monitor('TemporarySpaceMonitor')
+        return monitor_data['path']
+
+    def get_temp_size(self):
+        """
+        Returns the size in bytes of the node's temp directory.
+        """
+        monitor_data = self.get_monitor('TemporarySpaceMonitor')
+        return monitor_data['size']
+
+    def get_architecture(self):
+        """
+        Returns the system architecture of the node eg. "Linux (amd64)".
+        """
+        # no need to poll as the architecture will never change
+        return self.get_monitor('ArchitectureMonitor', poll_monitor=False)
+
+    def get_response_time(self):
+        """
+        Returns the node's average response time.
+        """
+        monitor_data = self.get_monitor('ResponseTimeMonitor')
+        return monitor_data['average']
+
+    def get_clock_difference(self):
+        """
+        Returns the difference between the node's clock and the master Jenkins clock.
+        Used to detect out of sync clocks.
+        """
+        monitor_data = self.get_monitor('ClockMonitor')
+        return monitor_data['diff']
