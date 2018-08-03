@@ -9,7 +9,7 @@ from setuptools import setup, find_packages
 package_root = os.path.dirname(os.path.realpath(__file__))
 setup(
     name="jenkinsapi",
-    version="0.4.1",
+    version="0.5.1",
     description="JenkinsAPI fork",
     maintainer="Julien Duchesne",
     maintainer_email="jduchesne@coveo.com",

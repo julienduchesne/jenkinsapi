@@ -174,7 +174,7 @@ class Credentials2x(Credentials):
     """
 
     def _poll(self, tree=None):
-        url = self.python_api_url(self.baseurl) + '?depth=2'
+        url = self.python_api_url(self.baseurl) + '?depth=1'
         data = self.get_data(url, tree=tree)
         credentials = data['credentials']
         new_creds = {}
